@@ -177,19 +177,103 @@ ORDER BY RuleForRole DESC, Role;
    Q2 - THE CLAIMS TO SEND TO BA FOR S1 / S2   (role could not be linked to an incident)
    Each row is one contact. 'IncidentTypesOnCase' shows what the TP case actually has.
    ===================================================================================== */
+DECLARE @Situation VARCHAR(2) = NULL;   -- 'S1' = case has incidents but no VehicleIncident, 'S2' = case has no incident at all, NULL = both
+
 SELECT P.CLAIM_REF                   AS ClaimRef,
        P.CaseID                      AS TP_CaseID,
        P.HDR_ID, P.ContactPublicID, P.HDR_TYPE_ID, P.LINK_TYPE_ID,
        P.Role,
        P.RuleForRole,
-       ISNULL(P.TypesOnCase, '(no incident on this case)') AS IncidentTypesOnCase,
        CASE WHEN P.IncidentsOnCase = 0
             THEN 'S2 - TP case has no incident'
-            ELSE 'S1 - TP case has no VehicleIncident' END AS Situation,
-       'Role KEPT, linked to claim only (IncidentID and ExposureID empty)' AS WhatTheLoadDoes
+            ELSE 'S1 - TP case has no VehicleIncident' END       AS Situation,
+       R.IncidentID                  AS LoadedIncidentID,         -- what the role row was loaded with (empty = claim-only)
+       R.ExposureID                  AS LoadedExposureID,
+       E.Exposure_Motor_PublicID     AS CaseExposureID,           -- what the TP case DOES have (one row per exposure)
+       E.SourceOrigin_Adm            AS CaseExposureType,
+       E.IncidentID                  AS CaseExposure_IncidentID,
+       I.Subtype                     AS CaseIncidentSubtype,
+       ISNULL(P.TypesOnCase, '(no incident on this case)')       AS IncidentTypesOnCase
 FROM #S_PICK P
+LEFT JOIN dbo.IS_CLAIMCONTACTROLE R
+       ON R.PublicID = 'mig:motorccr' + CONVERT(VARCHAR(20), P.HDR_ID) + '_' + P.Role
+LEFT JOIN dbo.IS_EXPOSURE_MOTOR E
+       ON CONVERT(VARCHAR(64), E.VectusCaseID_Adm) = P.CaseID
+      AND E.SourceOrigin_Adm IN ('TP_VEH','TP_INJ','TP_PRO','TP_HIRE')
+LEFT JOIN dbo.IS_INCIDENT I ON I.PublicID = E.IncidentID
 WHERE P.PickedIncidentID IS NULL
-ORDER BY Situation, P.Role, P.CLAIM_REF, P.CaseID;
+  AND ( @Situation IS NULL
+     OR (@Situation = 'S2' AND P.IncidentsOnCase = 0)
+     OR (@Situation = 'S1' AND P.IncidentsOnCase > 0) )
+ORDER BY Situation, P.Role, P.CLAIM_REF, P.CaseID, E.Exposure_Motor_PublicID;
+
+
+/* =====================================================================================
+   Q2b - S1 / S2 : WHAT INCIDENTS AND EXPOSURES DOES THE CLAIM ACTUALLY HAVE?
+   Every role should end up on an incident. For the contacts above no incident was picked, so this
+   lists everything IS_EXPOSURE_MOTOR / IS_INCIDENT holds for the SAME CLAIM (all exposures of the claim,
+   not only the contact's TP case), and says whether each one belongs to the contact's own TP case.
+   Reading guide:
+     WhyNoIncidentPicked  - the reason the contact's TP case gave no vehicle incident
+     SameCaseAsContact    - 'same case' = exposure is on the contact's TP case; 'different case' = other case of the claim
+     ExposureIncidentID / IncidentSubtype - the incident that exposure belongs to
+   ===================================================================================== */
+DECLARE @Situation2 VARCHAR(2)   = NULL;   -- 'S1', 'S2' or NULL for both
+DECLARE @ClaimRef2  VARCHAR(100) = NULL;   -- optional: one claim reference
+
+SELECT P.CLAIM_REF                       AS ClaimRef,
+       P.CaseID                          AS ContactTP_CaseID,
+       P.HDR_ID, P.ContactPublicID, P.Role,
+       CASE WHEN P.IncidentsOnCase = 0 THEN 'S2' ELSE 'S1' END AS Situation,
+       CASE WHEN C.CaseID IS NULL      THEN 'No TP exposure carries this case ID (case ID not found in IS_EXPOSURE_MOTOR)'
+            WHEN C.Incidents = 0       THEN 'TP case has exposure(s) but none has an IncidentID'
+            ELSE 'TP case has incidents but none is a VehicleIncident' END AS WhyNoIncidentPicked,
+       E.Exposure_Motor_PublicID         AS ClaimExposureID,
+       E.SourceOrigin_Adm                AS ExposureType,
+       E.VectusCaseID_Adm                AS ExposureCaseID,
+       CASE WHEN E.Exposure_Motor_PublicID IS NULL THEN 'claim has no exposure'
+            WHEN CONVERT(VARCHAR(64), E.VectusCaseID_Adm) = P.CaseID THEN 'same case'
+            ELSE 'different case' END    AS SameCaseAsContact,
+       E.IncidentID                      AS ExposureIncidentID,
+       I.Subtype                         AS IncidentSubtype
+FROM #S_PICK P
+LEFT JOIN #S_CASE C                ON C.CaseID = P.CaseID
+LEFT JOIN dbo.IS_EXPOSURE_MOTOR E  ON E.ClaimID = P.ClaimPublicID
+LEFT JOIN dbo.IS_INCIDENT I        ON I.PublicID = E.IncidentID
+WHERE P.PickedIncidentID IS NULL
+  AND ( @Situation2 IS NULL
+     OR (@Situation2 = 'S2' AND P.IncidentsOnCase = 0)
+     OR (@Situation2 = 'S1' AND P.IncidentsOnCase > 0) )
+  AND ( @ClaimRef2 IS NULL OR P.CLAIM_REF = @ClaimRef2 )
+ORDER BY Situation, P.Role, P.CLAIM_REF, P.CaseID, SameCaseAsContact, E.Exposure_Motor_PublicID;
+
+/* Q2c - the same thing as a count: why no incident was found, and does the claim have a VehicleIncident elsewhere? */
+;WITH ClaimVeh AS (
+    SELECT DISTINCT E.ClaimID
+    FROM dbo.IS_EXPOSURE_MOTOR E JOIN dbo.IS_INCIDENT I ON I.PublicID = E.IncidentID
+    WHERE I.Subtype = 'VehicleIncident'
+),
+ClaimAny AS (
+    SELECT DISTINCT ClaimID FROM dbo.IS_EXPOSURE_MOTOR
+)
+SELECT CASE WHEN P.IncidentsOnCase = 0 THEN 'S2' ELSE 'S1' END AS Situation,
+       CASE WHEN C.CaseID IS NULL THEN 'Contact case ID not found among TP exposures'
+            WHEN C.Incidents = 0  THEN 'TP case has exposure(s) but no IncidentID'
+            ELSE 'TP case has incidents but no VehicleIncident' END AS WhyNoIncidentPicked,
+       COUNT(*)                                                      AS ContactRoleRows,
+       COUNT(DISTINCT P.CLAIM_REF)                                   AS Claims,
+       SUM(CASE WHEN V.ClaimID IS NOT NULL THEN 1 ELSE 0 END)        AS Rows_ClaimHasAVehicleIncidentOnAnotherCase,
+       SUM(CASE WHEN A.ClaimID IS NULL     THEN 1 ELSE 0 END)        AS Rows_ClaimHasNoExposureAtAll
+FROM #S_PICK P
+LEFT JOIN #S_CASE C   ON C.CaseID = P.CaseID
+LEFT JOIN ClaimVeh V  ON V.ClaimID = P.ClaimPublicID
+LEFT JOIN ClaimAny A  ON A.ClaimID = P.ClaimPublicID
+WHERE P.PickedIncidentID IS NULL
+GROUP BY CASE WHEN P.IncidentsOnCase = 0 THEN 'S2' ELSE 'S1' END,
+         CASE WHEN C.CaseID IS NULL THEN 'Contact case ID not found among TP exposures'
+              WHEN C.Incidents = 0  THEN 'TP case has exposure(s) but no IncidentID'
+              ELSE 'TP case has incidents but no VehicleIncident' END
+ORDER BY Situation, ContactRoleRows DESC;
 
 
 /* =====================================================================================
