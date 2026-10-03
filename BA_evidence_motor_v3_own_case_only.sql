@@ -23,7 +23,8 @@ USE IntermediateStaging_DEV;
 GO
 
 /* ============================ PART 0 - IS IncidentType FILLED? ============================ */
--- 0a. expected: TP_VEH + TP_HIRE = VehicleIncident, TP_INJ = InjuryIncident, TP_PRO = FixedPropertyIncident
+-- 0a. what IncidentType really holds. Seen in the data: TP_VEH and TP_HIRE = 'VehicleDamage', TP_INJ = 'BodilyInjuryDamage'.
+--     Check the value for TP_PRO and AD / PA here. 'VehicleDamage' is what these queries (and the proc) treat as the vehicle incident.
 SELECT SourceOrigin_Adm, IncidentType,
        COUNT(*) AS Exposures,
        SUM(CASE WHEN IncidentID IS NULL THEN 1 ELSE 0 END) AS ExposuresWithoutIncidentID
@@ -58,7 +59,7 @@ CREATE CLUSTERED INDEX IX_T_EXP ON #T_EXP (CaseID);
 SELECT X.CaseID,
        COUNT(*)                                                                            AS Exposures,
        SUM(CASE WHEN X.IncidentID IS NOT NULL THEN 1 ELSE 0 END)                           AS ExposuresWithIncidentID,
-       SUM(CASE WHEN X.IncidentID IS NOT NULL AND X.IncidentType = 'VehicleIncident' THEN 1 ELSE 0 END) AS ExposuresOnVehicleIncident,
+       SUM(CASE WHEN X.IncidentID IS NOT NULL AND X.IncidentType = 'VehicleDamage' THEN 1 ELSE 0 END) AS ExposuresOnVehicleIncident,
        STRING_AGG(CONVERT(VARCHAR(MAX),
             X.ExposureID + ' [' + X.Origin + ']  -> incident: ' +
             ISNULL(X.IncidentID, '(NO IncidentID on this exposure)') +
@@ -91,7 +92,7 @@ CREATE NONCLUSTERED INDEX IX_T_BASE ON #T_BASE (TP_CaseID);
 SELECT B.*, C.Exposures, C.ExposuresWithIncidentID, C.ExposuresOnVehicleIncident, C.OwnExposuresAndIncidents,
        CASE WHEN C.CaseID IS NULL                  THEN 'P1 - this TP case has NO exposure (so no incident either)'
             WHEN C.ExposuresWithIncidentID = 0     THEN 'P2 - this TP case has exposure(s) but none has an IncidentID'
-            ELSE                                        'P3 - this TP case has incident(s) but none is a VehicleIncident'
+            ELSE                                        'P3 - this TP case has incident(s) but none is a vehicle incident (IncidentType VehicleDamage)'
        END AS Problem
 INTO #T_PROB
 FROM #T_BASE B
@@ -349,18 +350,16 @@ WHERE X.CaseID = @CaseID2;
 
 /* ============================ PART 5 - INCIDENT SUBTYPE IN IS_EXPOSURE_MOTOR ============================
    IS_EXPOSURE_MOTOR ALREADY HAS IncidentType. The exposure proc fills it (INSERT ... /* IncidentType */ R.IncidentType_Code)
-   from LKP_EXPOSURE_MOTOR_RULES: TP_VEH + TP_HIRE = VehicleIncident, TP_INJ = InjuryIncident, TP_PRO = FixedPropertyIncident.
+   from LKP_EXPOSURE_MOTOR_RULES: TP_VEH + TP_HIRE = VehicleDamage, TP_INJ = BodilyInjuryDamage (as seen in the data; check TP_PRO in Part 0a).
    So NO new column is needed IF Part 0 shows those values and 0b returns no rows.
-   Hire vs normal vehicle incident is told apart with SourceOrigin_Adm ('TP_HIRE' vs 'TP_VEH'), because both are VehicleIncident.
+   Hire vs normal vehicle incident is told apart with SourceOrigin_Adm ('TP_HIRE' vs 'TP_VEH'), because both are VehicleDamage.
 
    Only if Part 0 shows NULLs, check the rules table first:                                                         */
 SELECT RuleKey, V2CaseFlow, IncidentType_Code FROM dbo.LKP_EXPOSURE_MOTOR_RULES WHERE V2CaseFlow = 'GW MOTOR TP' ORDER BY RuleKey;
 
 /* If a rules row has NULL IncidentType_Code, fix the RULES TABLE (one UPDATE there), then re-run the exposure proc.
    Do not patch IS_EXPOSURE_MOTOR by hand.   Example (confirm the codes with BA first):
-   UPDATE dbo.LKP_EXPOSURE_MOTOR_RULES SET IncidentType_Code = 'VehicleIncident'      WHERE V2CaseFlow='GW MOTOR TP' AND RuleKey IN ('TP_VEH','TP_HIRE') AND IncidentType_Code IS NULL;
-   UPDATE dbo.LKP_EXPOSURE_MOTOR_RULES SET IncidentType_Code = 'InjuryIncident'       WHERE V2CaseFlow='GW MOTOR TP' AND RuleKey = 'TP_INJ'              AND IncidentType_Code IS NULL;
-   UPDATE dbo.LKP_EXPOSURE_MOTOR_RULES SET IncidentType_Code = 'FixedPropertyIncident' WHERE V2CaseFlow='GW MOTOR TP' AND RuleKey = 'TP_PRO'             AND IncidentType_Code IS NULL;
+   (the codes are the ones Part 0a shows, i.e. VehicleDamage / BodilyInjuryDamage; confirm the rest with BA)
 
    If you still want a SEPARATE column (only if you decide so), this is all it takes:
    ALTER TABLE dbo.IS_EXPOSURE_MOTOR ADD IncidentSubtype_Adm VARCHAR(50) NULL;
@@ -368,7 +367,7 @@ SELECT RuleKey, V2CaseFlow, IncidentType_Code FROM dbo.LKP_EXPOSURE_MOTOR_RULES 
    -- (same expression as the existing IncidentType column, so it would just duplicate it)
 
    LATER, when you decide to change the claim contact role proc (NOT now): replace its #MOTOR_INCIDENT_BY_CASE_VEH build, which
-   joins IS_INCIDENT on Subtype = 'VehicleIncident', with a filter on  EXP.IncidentType = 'VehicleIncident'  taken from the
+   joins IS_INCIDENT on Subtype = 'VehicleIncident', with a filter on  EXP.IncidentType = 'VehicleDamage'  taken from the
    IS_EXPOSURE_MOTOR rows it already reads. That removes the IS_INCIDENT dependency.                                     */
 
 
@@ -480,7 +479,7 @@ GROUP BY E.SourceOrigin_Adm, G.Role ORDER BY ExposureRoleGroups DESC;
 SELECT R.Role,
        SUM(CASE WHEN C.ExposuresOnVehicleIncident > 0 AND R.IncidentID IS NULL THEN 1 ELSE 0 END) AS V1_CaseHasVehicleIncidentButRoleHasNone,
        SUM(CASE WHEN R.IncidentID IS NOT NULL AND NOT EXISTS (SELECT 1 FROM #T_EXP X WHERE X.CaseID = CONVERT(VARCHAR(64), HDR.CASEID)
-                                                               AND X.IncidentID = R.IncidentID AND X.IncidentType = 'VehicleIncident')
+                                                               AND X.IncidentID = R.IncidentID AND X.IncidentType = 'VehicleDamage')
                 THEN 1 ELSE 0 END) AS V2_RoleLinkedToNonVehicleIncident
 FROM dbo.IS_CLAIMCONTACTROLE R
 CROSS APPLY (SELECT TRY_CONVERT(BIGINT, SUBSTRING(R.PublicID, 13, NULLIF(CHARINDEX('_', R.PublicID, 13), 0) - 13)) AS HDR_ID) H
